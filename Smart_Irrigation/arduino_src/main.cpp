@@ -9,6 +9,7 @@
     1. "DHT sensor library"         by Adafruit   (^1.4.7)
     2. "Adafruit Unified Sensor"    by Adafruit   (^1.1.14)
     3. "NimBLE-Arduino"             by h2zero      (^1.4.2)
+    4. "Blynk"                      by Volodymyr Shymanskyy (^1.3.2)
  ================================================================================
   FEATURES:
     [x] Wi-Fi Web Server  - Access Point (AP) + optional Home Wi-Fi (STA) mode
@@ -32,10 +33,19 @@
 */
 
 // ============================================================================
+//  BLYNK IOT CONFIGURATION (Must precede all includes)
+// ============================================================================
+// Paste your Template ID and Name from Blynk Console -> Developer Zone -> Templates
+#define BLYNK_TEMPLATE_ID   "TMPL3Yic5OqHo"
+#define BLYNK_TEMPLATE_NAME "Smart Irrigation"
+#define BLYNK_AUTH_TOKEN    "Nolq8tRwI0qlmqj9C3dnzPU7NkkRbE5z"
+
+// ============================================================================
 //  LIBRARY INCLUDES
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <nvs_flash.h>
@@ -55,8 +65,8 @@ extern "C" bool btInUse(void)  { return true; }
 
 // --- 1. WI-FI CREDENTIALS ---
 // Leave WIFI_SSID as "YOUR_WIFI_SSID" to skip home router connection.
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "YAGNIKJIO4A2,4";
+const char* WIFI_PASS = "chirchinkoam4@";
 
 // ESP32 built-in Access Point (always active)
 const char* AP_SSID = "Smart_Irrigation_ESP32";
@@ -187,6 +197,9 @@ void setPump(bool on) {
       digitalWrite(RELAY_PIN, LOW);
     }
     pumpActive = false;
+  }
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V4, pumpActive ? 1 : 0);
   }
 }
 
@@ -346,9 +359,11 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     } else if (cmd.startsWith("SET_DRY=")) {
       soilDryThreshold = cmd.substring(8).toFloat();
       savePreferences();
+      if (Blynk.connected()) Blynk.virtualWrite(V5, (int)soilDryThreshold);
     } else if (cmd.startsWith("SET_WET=")) {
       soilWetThreshold = cmd.substring(8).toFloat();
       savePreferences();
+      if (Blynk.connected()) Blynk.virtualWrite(V6, (int)soilWetThreshold);
     } else if (cmd.startsWith("SET_MIN=")) {
       waterMinThreshold = cmd.substring(8).toFloat();
       savePreferences();
@@ -408,6 +423,65 @@ void setupBLE() {
   pAdv->start();
 
   Serial.println(F("[BLE] Nordic UART Service started - advertising"));
+}
+
+// ============================================================================
+//  BLYNK CALLBACKS & HANDLERS
+// ============================================================================
+
+// V4: Pump Manual Switch (0 = OFF, 1 = ON)
+BLYNK_WRITE(V4) {
+  int switchVal = param.asInt();
+  if (switchVal == 1) {
+    if (cachedWaterPct >= waterMinThreshold) {
+      currentMode = MODE_MANUAL;
+      setPump(true);
+      currentStatus = STATUS_MANUAL_ON;
+      Serial.println(F("[Blynk] Manual Pump ON"));
+    } else {
+      Serial.println(F("[Blynk] Pump ON blocked: Water tank level too low!"));
+      Blynk.virtualWrite(V4, 0); // Revert switch in Blynk console
+    }
+  } else {
+    setPump(false);
+    currentMode = MODE_AUTO; // Resume automatic regulation
+    currentStatus = STATUS_SOIL_MOIST;
+    Serial.println(F("[Blynk] Pump OFF (Resumed Auto Mode)"));
+  }
+}
+
+// V5: Soil Moisture Min Threshold (Dry % -> Pump Turns ON)
+BLYNK_WRITE(V5) {
+  float newMin = param.asFloat();
+  if (newMin >= 0.0f && newMin < soilWetThreshold) {
+    soilDryThreshold = newMin;
+    savePreferences();
+    Serial.printf("[Blynk] Min threshold set to: %.0f%%\n", soilDryThreshold);
+  } else {
+    Serial.println(F("[Blynk] Invalid Min Threshold (must be less than Max)"));
+    Blynk.virtualWrite(V5, (int)soilDryThreshold); // Revert slider
+  }
+}
+
+// V6: Soil Moisture Max Threshold (Wet % -> Pump Turns OFF)
+BLYNK_WRITE(V6) {
+  float newMax = param.asFloat();
+  if (newMax > soilDryThreshold && newMax <= 100.0f) {
+    soilWetThreshold = newMax;
+    savePreferences();
+    Serial.printf("[Blynk] Max threshold set to: %.0f%%\n", soilWetThreshold);
+  } else {
+    Serial.println(F("[Blynk] Invalid Max Threshold (must be greater than Min)"));
+    Blynk.virtualWrite(V6, (int)soilWetThreshold); // Revert slider
+  }
+}
+
+// Sync values when device connects to Blynk Cloud
+BLYNK_CONNECTED() {
+  Serial.println(F("[Blynk] Connected to Blynk Cloud!"));
+  Blynk.virtualWrite(V4, pumpActive ? 1 : 0);
+  Blynk.virtualWrite(V5, (int)soilDryThreshold);
+  Blynk.virtualWrite(V6, (int)soilWetThreshold);
 }
 
 // ============================================================================
@@ -1136,7 +1210,13 @@ void handleApiConfig() {
   if (server.hasArg("tank"))   { waterMinThreshold  = server.arg("tank").toFloat(); changed = true; }
   if (server.hasArg("wEmpty")) { WATER_EMPTY_RAW    = server.arg("wEmpty").toInt(); changed = true; }
   if (server.hasArg("wFull"))  { WATER_FULL_RAW     = server.arg("wFull").toInt();  changed = true; }
-  if (changed) savePreferences();
+  if (changed) {
+    savePreferences();
+    if (Blynk.connected()) {
+      Blynk.virtualWrite(V5, (int)soilDryThreshold);
+      Blynk.virtualWrite(V6, (int)soilWetThreshold);
+    }
+  }
   server.send(200, "text/plain", "OK");
 }
 
@@ -1284,6 +1364,11 @@ void setup() {
     }
     if (WiFi.status() == WL_CONNECTED) {
       Serial.printf("\n[STA] Connected! URL: http://%s\n", WiFi.localIP().toString().c_str());
+      if (String(BLYNK_AUTH_TOKEN) != "YOUR_AUTH_TOKEN") {
+        Blynk.config(BLYNK_AUTH_TOKEN);
+        Blynk.connect();
+        Serial.println(F("[Blynk] Connecting to Blynk Cloud..."));
+      }
     } else {
       Serial.println(F("\n[STA] Timed out - AP-only mode active"));
     }
@@ -1319,9 +1404,14 @@ void loop() {
   // 1. Handle HTTP clients
   server.handleClient();
 
+  // 2. Handle Blynk connection & events (non-blocking)
+  if (WiFi.status() == WL_CONNECTED && String(BLYNK_AUTH_TOKEN) != "YOUR_AUTH_TOKEN") {
+    Blynk.run();
+  }
+
   unsigned long now = millis();
 
-  // 2. Periodic sensor read + automation cycle
+  // 3. Periodic sensor read + automation cycle
   if (now - lastSensorTime >= SENSOR_INTERVAL_MS) {
     lastSensorTime = now;
 
@@ -1336,6 +1426,16 @@ void loop() {
 
     // -- BLE status broadcast -----------------------------
     bleSendStatus();
+
+    // -- Blynk telemetry broadcast ------------------------
+    if (Blynk.connected()) {
+      Blynk.virtualWrite(V0, (int)cachedSoilPct);
+      Blynk.virtualWrite(V1, (int)cachedWaterPct);
+      if (dhtValid) {
+        Blynk.virtualWrite(V2, cachedTemp);
+        Blynk.virtualWrite(V3, cachedHumidity);
+      }
+    }
 
     // Restore status LED to ON
     digitalWrite(LED_PIN, HIGH);
