@@ -36,9 +36,9 @@
 //  BLYNK IOT CONFIGURATION (Must precede all includes)
 // ============================================================================
 // Paste your Template ID and Name from Blynk Console -> Developer Zone -> Templates
-#define BLYNK_TEMPLATE_ID   "TMPLxxxxxx"
+#define BLYNK_TEMPLATE_ID   "TMPL3Yic5OqHo"
 #define BLYNK_TEMPLATE_NAME "Smart Irrigation"
-#define BLYNK_AUTH_TOKEN    "YOUR_AUTH_TOKEN"
+#define BLYNK_AUTH_TOKEN    "Nolq8tRwI0qlmqj9C3dnzPU7NkkRbE5z"
 
 // ============================================================================
 //  LIBRARY INCLUDES
@@ -60,8 +60,8 @@
 
 // --- 1. WI-FI CREDENTIALS ---
 // Leave WIFI_SSID as "YOUR_WIFI_SSID" to skip home router connection.
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "YAGNIKJIO4A2,4";
+const char* WIFI_PASS = "chirchinkoam4@";
 
 // ESP32 built-in Access Point (always active)
 const char* AP_SSID = "Smart_Irrigation_ESP32";

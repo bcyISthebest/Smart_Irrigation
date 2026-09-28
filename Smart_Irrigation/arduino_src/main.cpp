@@ -98,13 +98,14 @@ int WATER_FULL_RAW  = 2800;  // ADC fully submerged (full tank - reads ~2500-320
 // --- 5. IRRIGATION THRESHOLDS (%) - saved to NVS ---
 float soilDryThreshold  = 30.0f;  // Pump ON  below this soil moisture %
 float soilWetThreshold  = 50.0f;  // Pump OFF above this soil moisture %
-float waterMinThreshold = 15.0f;  // Minimum tank % required to allow pumping
+float waterMinThreshold = 0.0f;   // Minimum tank % required to allow pumping (0% = cutoff when empty)
 
 // --- 6. TIMING ---
 #define SENSOR_INTERVAL_MS      5000    // How often to run the main sensor loop
 #define WATER_POWER_SETTLE_MS     80    // Settle time after powering water sensor (ms)
 #define WATER_POWER_ON_MS        100    // Total time water sensor VCC is held HIGH
 #define MAX_PUMP_RUNTIME_MS   120000    // Safety cutoff: 2 min max continuous pumping
+#define WIFI_CONNECT_TIMEOUT_MS 60000   // Wi-Fi connection timeout: at least 1 minute (60s)
 
 // ============================================================================
 //  BLE UUIDs  (Nordic UART Service)
@@ -132,7 +133,7 @@ IrrigationMode currentMode = MODE_AUTO;
 SystemStatus   currentStatus = STATUS_SOIL_MOIST;
 
 bool pumpActive    = false;
-bool bleEnabled    = true;
+bool bleEnabled    = false; // Disabled: leaves 100% antenna and CPU for Wi-Fi & Blynk App
 bool bleConnected  = false;
 
 unsigned long lastSensorTime  = 0;
@@ -183,6 +184,25 @@ NimBLECharacteristic* pRxChar     = nullptr;
  */
 void setPump(bool on) {
   if (on) {
+    // Safety check 1: Pump cannot turn on if water level is 0
+    if (cachedWaterPct <= 0.0f) {
+      Serial.println(F("[SAFETY] Pump ON blocked: Water level is 0 (tank empty)!"));
+      pumpActive = false;
+      if (Blynk.connected()) {
+        Blynk.virtualWrite(V4, 0);
+      }
+      return;
+    }
+    // Safety check 2: Pump cannot turn on if soil has reached or exceeded max threshold
+    if (cachedSoilPct >= soilWetThreshold) {
+      Serial.printf("[SAFETY] Pump ON blocked: Soil already at/above max threshold (%.1f%% >= %.1f%%)!\n",
+                    cachedSoilPct, soilWetThreshold);
+      pumpActive = false;
+      if (Blynk.connected()) {
+        Blynk.virtualWrite(V4, 0);
+      }
+      return;
+    }
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
     if (!pumpActive) pumpStartTime = millis();
@@ -269,10 +289,10 @@ const char* statusString() {
 //  NVS / PREFERENCES  (survive reboot)
 // ============================================================================
 void loadPreferences() {
-  prefs.begin("irrigation", true);   // read-only namespace
+  prefs.begin("irrigation", false);   // read-write namespace
   soilDryThreshold  = prefs.getFloat("soilDry",   soilDryThreshold);
   soilWetThreshold  = prefs.getFloat("soilWet",   soilWetThreshold);
-  waterMinThreshold = prefs.getFloat("waterMin",  waterMinThreshold);
+  waterMinThreshold = prefs.getFloat("waterMin",  0.0f);
   WATER_EMPTY_RAW   = prefs.getInt("wEmptyRaw",   WATER_EMPTY_RAW);
   WATER_FULL_RAW    = prefs.getInt("wFullRaw",    WATER_FULL_RAW);
   SOIL_DRY_RAW      = prefs.getInt("sDryRaw",     SOIL_DRY_RAW);
@@ -345,12 +365,17 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
       if (currentMode == MODE_MANUAL) {
         cachedWaterRaw = readWaterLevelRaw();
         cachedWaterPct = rawToPercent(cachedWaterRaw, WATER_EMPTY_RAW, WATER_FULL_RAW);
-        if (cachedWaterPct >= waterMinThreshold) {
+        cachedSoilRaw  = readADCAvg(SOIL_PIN);
+        cachedSoilPct  = rawToPercent(cachedSoilRaw, SOIL_DRY_RAW, SOIL_WET_RAW);
+        if (cachedWaterPct <= 0.0f) {
+          if (pTxChar) pTxChar->setValue("ERR: Water level is 0");
+          if (pTxChar) pTxChar->notify();
+        } else if (cachedSoilPct >= soilWetThreshold) {
+          if (pTxChar) pTxChar->setValue("ERR: Soil at/above max threshold");
+          if (pTxChar) pTxChar->notify();
+        } else {
           setPump(true);
           currentStatus = STATUS_MANUAL_ON;
-        } else {
-          if (pTxChar) pTxChar->setValue("ERR: Tank too low");
-          if (pTxChar) pTxChar->notify();
         }
       }
     } else if (cmd == "PUMP_OFF") {
@@ -433,14 +458,23 @@ void setupBLE() {
 BLYNK_WRITE(V4) {
   int switchVal = param.asInt();
   if (switchVal == 1) {
-    if (cachedWaterPct >= waterMinThreshold) {
+    cachedWaterRaw = readWaterLevelRaw();
+    cachedWaterPct = rawToPercent(cachedWaterRaw, WATER_EMPTY_RAW, WATER_FULL_RAW);
+    cachedSoilRaw  = readADCAvg(SOIL_PIN);
+    cachedSoilPct  = rawToPercent(cachedSoilRaw, SOIL_DRY_RAW, SOIL_WET_RAW);
+
+    if (cachedWaterPct <= 0.0f) {
+      Serial.println(F("[Blynk] Pump ON blocked: Water level is 0!"));
+      Blynk.virtualWrite(V4, 0); // Revert switch in Blynk console
+    } else if (cachedSoilPct >= soilWetThreshold) {
+      Serial.printf("[Blynk] Pump ON blocked: Soil already at/above max threshold (%.1f%% >= %.1f%%)!\n",
+                    cachedSoilPct, soilWetThreshold);
+      Blynk.virtualWrite(V4, 0); // Revert switch in Blynk console
+    } else {
       currentMode = MODE_MANUAL;
       setPump(true);
       currentStatus = STATUS_MANUAL_ON;
       Serial.println(F("[Blynk] Manual Pump ON"));
-    } else {
-      Serial.println(F("[Blynk] Pump ON blocked: Water tank level too low!"));
-      Blynk.virtualWrite(V4, 0); // Revert switch in Blynk console
     }
   } else {
     setPump(false);
@@ -476,12 +510,25 @@ BLYNK_WRITE(V6) {
   }
 }
 
+// Helper to immediately push all sensor data and pump status to Blynk App
+void sendBlynkTelemetry() {
+  if (!Blynk.connected()) return;
+  Blynk.virtualWrite(V0, (int)cachedSoilPct);
+  Blynk.virtualWrite(V1, (int)cachedWaterPct);
+  if (dhtValid) {
+    Blynk.virtualWrite(V2, cachedTemp);
+    Blynk.virtualWrite(V3, cachedHumidity);
+  }
+  Blynk.virtualWrite(V4, pumpActive ? 1 : 0);
+}
+
 // Sync values when device connects to Blynk Cloud
 BLYNK_CONNECTED() {
   Serial.println(F("[Blynk] Connected to Blynk Cloud!"));
   Blynk.virtualWrite(V4, pumpActive ? 1 : 0);
   Blynk.virtualWrite(V5, (int)soilDryThreshold);
   Blynk.virtualWrite(V6, (int)soilWetThreshold);
+  sendBlynkTelemetry(); // Immediately transmit live state to app
 }
 
 // ============================================================================
@@ -1011,12 +1058,12 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       document.getElementById('water-fill').style.height = wPct + '%';
       document.getElementById('water-raw').textContent = 'raw ' + d.waterRaw;
       document.getElementById('water-sub').textContent =
-        wPct < d.waterMinThresh ? '?? Tank too low -- pump locked!' : 'Min floor: ' + d.waterMinThresh + ' %';
+        wPct <= 0 ? '⚠️ Tank empty -- pump locked!' : 'Level: ' + wPct.toFixed(0) + ' %';
 
       // --- Climate ---
-      document.getElementById('temp-val').textContent = d.dhtValid ? d.temp.toFixed(1) + ' ?C' : '-- ?C';
+      document.getElementById('temp-val').textContent = d.dhtValid ? d.temp.toFixed(1) + ' °C' : '-- °C';
       document.getElementById('hum-val').textContent  = d.dhtValid ? d.humidity.toFixed(1) + ' %' : '-- %';
-      document.getElementById('dht-status').textContent = d.dhtValid ? '[x]' : '?';
+      document.getElementById('dht-status').textContent = d.dhtValid ? '✔' : '✘';
       const hi = d.temp > 35 ? 'Hot & dry -- more watering may be needed'
                : d.temp < 10 ? 'Cold -- reduce irrigation frequency'
                : 'Climate normal';
@@ -1025,7 +1072,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       // --- Status pill ---
       const pill = document.getElementById('status-pill');
       pill.textContent = d.statusText;
-      pill.className = 'pill ' + (d.pump ? 'green' : wPct < d.waterMinThresh ? 'red' : '');
+      pill.className = 'pill ' + (d.pump ? 'green' : wPct <= 0 ? 'red' : '');
 
       // --- Pump ---
       pumpActive = d.pump;
@@ -1098,7 +1145,11 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   async function togglePump() {
     const next = pumpActive ? 'off' : 'on';
     const res  = await fetch('/api/pump?set=' + next);
-    if (!res.ok) { toast('⚠️ Tank too low to start pump!'); return; }
+    if (!res.ok) {
+      const msg = await res.text();
+      toast('⚠️ ' + (msg.length > 5 ? msg.replace('ERR: ', '') : 'Water empty or soil at max threshold!'));
+      return;
+    }
     fetchData();
   }
 
@@ -1181,23 +1232,35 @@ void handleApiMode() {
 }
 
 void handleApiPump() {
-  if (server.hasArg("set") && currentMode == MODE_MANUAL) {
+  if (server.hasArg("set")) {
     String p = server.arg("set");
     if (p == "on") {
-      // Fresh reading right before turning on pump
+      // Fresh readings right before turning on pump
       cachedWaterRaw = readWaterLevelRaw();
       cachedWaterPct = rawToPercent(cachedWaterRaw, WATER_EMPTY_RAW, WATER_FULL_RAW);
-      if (cachedWaterPct >= waterMinThreshold) {
-        setPump(true);
-        currentStatus = STATUS_MANUAL_ON;
-      } else {
+      cachedSoilRaw  = readADCAvg(SOIL_PIN);
+      cachedSoilPct  = rawToPercent(cachedSoilRaw, SOIL_DRY_RAW, SOIL_WET_RAW);
+
+      if (cachedWaterPct <= 0.0f) {
         currentStatus = STATUS_LOW_WATER;
-        server.send(400, "text/plain", "ERR: Tank level too low");
+        server.send(400, "text/plain", "ERR: Water level is 0 (tank empty)");
         return;
       }
+      if (cachedSoilPct >= soilWetThreshold) {
+        currentStatus = STATUS_SOIL_MOIST;
+        server.send(400, "text/plain", "ERR: Soil already reached max threshold");
+        return;
+      }
+
+      currentMode = MODE_MANUAL;   // Auto-switch to manual (mirrors Blynk V4 handler)
+      setPump(true);
+      currentStatus = STATUS_MANUAL_ON;
+      Serial.println(F("[Web] Pump ON (switched to Manual mode)"));
     } else {
       setPump(false);
+      currentMode = MODE_AUTO;       // Resume auto mode when turning off (mirrors Blynk V4)
       currentStatus = STATUS_SOIL_MOIST;
+      Serial.println(F("[Web] Pump OFF (resumed Auto mode)"));
     }
   }
   server.send(200, "text/plain", "OK");
@@ -1249,7 +1312,7 @@ void updateSensors() {
 // ============================================================================
 
 void runAutomation() {
-  bool waterOK = (cachedWaterPct >= waterMinThreshold);
+  bool waterEmpty = (cachedWaterPct <= 0.0f);
   unsigned long now = millis();
 
   // Safety watchdog: cut pump if runtime exceeds maximum (applies to both modes)
@@ -1260,12 +1323,26 @@ void runAutomation() {
     return;
   }
 
-  if (currentMode == MODE_AUTO) {
-    if (!waterOK) {
+  // Safety override for ANY mode: turn off pump immediately if water level is 0
+  if (waterEmpty) {
+    if (pumpActive) {
       setPump(false);
-      currentStatus = STATUS_LOW_WATER;
-      return;
+      Serial.println(F("[SAFETY] Water level is 0 - pump forced OFF"));
     }
+    currentStatus = STATUS_LOW_WATER;
+    if (currentMode == MODE_AUTO) return;
+  }
+
+  // Safety override for ANY mode: turn off pump if soil reaches or exceeds max threshold
+  if (cachedSoilPct >= soilWetThreshold && pumpActive) {
+    setPump(false);
+    currentStatus = STATUS_SOIL_MOIST;
+    Serial.printf("[SAFETY] Soil reached max threshold (%.1f%% >= %.1f%%) - pump turned OFF\n",
+                  cachedSoilPct, soilWetThreshold);
+  }
+
+  if (currentMode == MODE_AUTO) {
+    if (waterEmpty) return;
 
     if (!dhtValid) {
       currentStatus = STATUS_SENSOR_ERROR;
@@ -1284,11 +1361,10 @@ void runAutomation() {
     }
 
   } else {
-    // Manual mode: enforce water safety override
-    if (!waterOK && pumpActive) {
+    // Manual mode: enforce water level 0 cutoff
+    if (waterEmpty && pumpActive) {
       setPump(false);
       currentStatus = STATUS_LOW_WATER;
-      Serial.println(F("[SAFETY] Manual mode: reservoir empty/low - pump forced OFF"));
     }
   }
 }
@@ -1298,6 +1374,10 @@ void runAutomation() {
 // ============================================================================
 
 void setup() {
+  // Brief delay at boot: allows the USB-UART chip's DTR/RTS lines to settle
+  // so the ESP32 runs correctly whether or not the Serial Monitor is open.
+  delay(500);
+
   Serial.begin(115200);
 
   // Status LED: light up immediately to indicate system is powered and running
@@ -1346,38 +1426,45 @@ void setup() {
   Serial.printf("[NVS] Thresholds loaded  Dry=%.0f%%  Wet=%.0f%%  MinTank=%.0f%%\n",
                 soilDryThreshold, soilWetThreshold, waterMinThreshold);
 
-  // --- Wi-Fi: Access Point + optional Station mode ---
-  WiFi.mode(WIFI_AP_STA);
+  // --- Wi-Fi + Blynk: non-blocking standalone setup ---
+  // Blynk.config() sets credentials without blocking. Blynk.run() in the loop
+  // then manages WiFi keep-alive and Blynk cloud reconnection automatically
+  // — no Serial Monitor required for operation.
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);   // OS-level auto-reconnect if router drops
+  WiFi.persistent(true);         // Credentials survive reboot without calling WiFi.begin again
 
-  WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.printf("[AP]  SSID : %s\n", AP_SSID);
-  Serial.printf("[AP]  URL  : http://%s\n", WiFi.softAPIP().toString().c_str());
+  if (String(BLYNK_AUTH_TOKEN) != "YOUR_AUTH_TOKEN") {
+    Blynk.config(BLYNK_AUTH_TOKEN); // Set token; connection happens in Blynk.run()
+  }
 
   if (String(WIFI_SSID) != "YOUR_WIFI_SSID") {
-    Serial.printf("[STA] Connecting to '%s' ", WIFI_SSID);
+    Serial.printf("[STA] Connecting to '%s'...\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    // Wait up to WIFI_CONNECT_TIMEOUT_MS for initial connection at boot.
+    // If it fails here, Blynk.run() + WiFi.setAutoReconnect will keep retrying in the loop.
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < WIFI_CONNECT_TIMEOUT_MS) {
       delay(500);
       Serial.print('.');
-      tries++;
     }
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("\n[STA] Connected! URL: http://%s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("\n[STA] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
       if (String(BLYNK_AUTH_TOKEN) != "YOUR_AUTH_TOKEN") {
-        Blynk.config(BLYNK_AUTH_TOKEN);
-        Blynk.connect();
         Serial.println(F("[Blynk] Connecting to Blynk Cloud..."));
+        Blynk.connect(10000); // 10 s initial attempt; Blynk.run() retries forever after this
+        Serial.printf("[Blynk] %s\n", Blynk.connected() ? "Connected!" : "Will retry in loop");
       }
     } else {
-      Serial.println(F("\n[STA] Timed out - AP-only mode active"));
+      Serial.println(F("\n[STA] WiFi not reached at boot - Blynk.run() will keep retrying"));
     }
   }
 
-  // --- Initial sensor reading so dashboard has data immediately ---
+  // --- Initial sensor reading so Blynk has data immediately on connect ---
   updateSensors();
+  sendBlynkTelemetry();
 
-  // --- Web Server routes ---
+  // --- Web Server routes (accessible via home Wi-Fi IP if needed) ---
   server.on("/",           handleRoot);
   server.on("/api/data",   handleApiData);
   server.on("/api/mode",   handleApiMode);
@@ -1392,7 +1479,7 @@ void setup() {
   }
 
   Serial.println(F("\n-------------------------------------------------"));
-  Serial.println(F("  System ready!  Connect to dashboard or BLE."));
+  Serial.println(F("  System ready! Autonomous irrigation running."));
   Serial.println(F("-------------------------------------------------\n"));
 }
 
@@ -1401,15 +1488,16 @@ void setup() {
 // ============================================================================
 
 void loop() {
-  // 1. Handle HTTP clients
-  server.handleClient();
+  unsigned long now = millis();
 
-  // 2. Handle Blynk connection & events (non-blocking)
-  if (WiFi.status() == WL_CONNECTED && String(BLYNK_AUTH_TOKEN) != "YOUR_AUTH_TOKEN") {
+  // 1. Run Blynk (handles WiFi keep-alive, cloud reconnection, and virtual pin callbacks).
+  //    Blynk.run() is safe to call even when disconnected — it will reconnect automatically.
+  if (String(BLYNK_AUTH_TOKEN) != "YOUR_AUTH_TOKEN") {
     Blynk.run();
   }
 
-  unsigned long now = millis();
+  // 2. Handle HTTP clients (optional local dashboard)
+  server.handleClient();
 
   // 3. Periodic sensor read + automation cycle
   if (now - lastSensorTime >= SENSOR_INTERVAL_MS) {
@@ -1424,25 +1512,20 @@ void loop() {
     // -- Automation decision ------------------------------
     runAutomation();
 
-    // -- BLE status broadcast -----------------------------
-    bleSendStatus();
-
-    // -- Blynk telemetry broadcast ------------------------
-    if (Blynk.connected()) {
-      Blynk.virtualWrite(V0, (int)cachedSoilPct);
-      Blynk.virtualWrite(V1, (int)cachedWaterPct);
-      if (dhtValid) {
-        Blynk.virtualWrite(V2, cachedTemp);
-        Blynk.virtualWrite(V3, cachedHumidity);
-      }
+    // -- BLE status broadcast (if enabled) ----------------
+    if (bleEnabled) {
+      bleSendStatus();
     }
+
+    // -- Blynk telemetry broadcast to app -----------------
+    sendBlynkTelemetry();
 
     // Restore status LED to ON
     digitalWrite(LED_PIN, HIGH);
 
     // -- Serial monitor summary ---------------------------
     Serial.printf("[SENS] Soil: %.1f%% (raw %d) | Water: %.1f%% (raw %d) | "
-                  "Temp: %.1f?C | Hum: %.1f%% | Pump: %s | Mode: %s\n",
+                  "Temp: %.1fC | Hum: %.1f%% | Pump: %s | Mode: %s\n",
                   cachedSoilPct, cachedSoilRaw,
                   cachedWaterPct, cachedWaterRaw,
                   cachedTemp, cachedHumidity,
